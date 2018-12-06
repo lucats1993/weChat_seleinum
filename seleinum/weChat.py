@@ -1,42 +1,55 @@
 # coding: utf-8
-from selenium import webdriver
-from hashlib import md5
-import base64
-import time
-from bs4 import BeautifulSoup
-import requests
+
 import re
+import os
+import time
+import base64
 import pymongo
-
-
+import requests
+import subprocess
+import configparser
+from hashlib import md5
+from selenium import webdriver
+from bs4 import BeautifulSoup
 """
 note: 需要使用selenium，chrome版本需要与chromedriver版本对应。具体见https://chromedriver.storage.googleapis.com/
 """
+class MyException(Exception):
+    def __init__(self,message):
+        Exception.__init__(self)
+        self.message=message
+
 class WeChat():
     def __init__(self,logging):
         self.driver = None
-        self.logging =logging
+        self.logging = logging
         self.sleep_time =3
-        self.date =self.get_date()
+        self.date = self.get_date()
         self.to_spider_accounts = self.get_accounts(self.date)
-        self.prepare_db()
 
-    def prepare(self,account):
+    def prepare_chrome(self,account_id):
+        """
+        :param account_id: 配置文件中登录账户标识id
+        :return:
+        """
         self.logging.info('准备工作开始！')
         self.logging.info('新建chrome！')
         self.driver = webdriver.Chrome()
         self.logging.info('开始登录')
-        self.logining(account)
+        self.logining(account_id)
         self.logging.info('登录成功')
         self.jump_to_article()
         self.logging.info('准备工作结束')
+        self.prepare_db()
 
     def prepare_db(self):
         myclient = pymongo.MongoClient("mongodb://localhost:27017/")
         mydb = myclient["weChat"]
-        self.media_db = mydb["media"]
-        self.media_new_db = mydb["media"+self.date]
-        self.account_db = mydb["weChat_account"]
+        self.db={
+            "account_col":mydb["weChat_account"],
+            "media_col": mydb["media"],
+            "new_media_col": mydb["media"+self.date],
+        }
 
     def spider_articles(self):
         """
@@ -47,41 +60,40 @@ class WeChat():
             'number'://结束爬取时的公众号编号
         }
         """
-        d={"index":0,"fakeid":''}
         for i, nickinfo in enumerate(self.to_spider_accounts):
-            d['index'] =i+1
-            d['fakeid'] = nickinfo.get("_id")
             self.logging.info("公众号%d：%s,最近更新时间：%s，爬取开始，" % (i+1, nickinfo.get("weChat_name"), nickinfo.get('last_update_time')))
             self.sleep(i + 1)
-            is_success =False
             retry_times =1
-            while not is_success and retry_times <4:
-                is_success = self.get_info(nickinfo)
-                if not is_success:
-                    self.logging.info("故障,重试第%d次" %retry_times)
-                    retry_times = retry_times +1
-            d['is_success'] =is_success
-            if is_success:
-                self.account_db.update({"_id": nickinfo.get('_id')}, {"$set": {"last_update_time": self.date}})
+            res = self.get_info(nickinfo)
+            if res.get("error_code") != "001":
+                while not res.get("result") and retry_times < 4:
+                    self.logging.info("故障,重试第%d次" % retry_times)
+                    res = self.get_info(nickinfo)
+                    retry_times = retry_times + 1
+                if not res.get("result"):
+                    self.logging.info("重试%d次，爬取失败，结束程序" % retry_times)
+                    break
             else:
-                self.logging.info("重试%d次，爬取失败，结束程序" % retry_times)
                 break
+            self.db.get("account_col").update({"_id": nickinfo.get('_id')},
+                                                  {"$set": {"last_spider_time": self.date}})
             self.recover_search()
-        return d
 
     def get_info(self,nickinfo):
-        is_success_spider =False
+        data={"result":False,"error_code":""}
         nickname = nickinfo.get("weChat_name")
         try:
-            if self.get_search(nickname):
+            if self.get_account_info(nickname):
                 time.sleep(self.sleep_time)
                 result = self.get_articles(nickinfo.get("_id"))
                 if result.get("data"):
-                    self.media_new_db.insert_many(result.get("data"))
-                    last_time = result.get("data")[0].get('time')
+                    self.db.get("new_media_col").insert_many(result.get("data"))
+                    self.db.get("media_col").insert_many(result.get("data"))
+                    last_time = result.get("data")[0].get('time').replace("-", "")
                     if (nickinfo.get('last_update_time') != last_time):
                         self.logging.info("发布时间更新至：%s" % last_time)
-                        self.account_db.update({"_id": nickinfo.get('_id')}, {"$set": {"last_update_time": last_time}})
+                        self.db.get("account_col").update({"_id": nickinfo.get('_id')},
+                                                          {"$set": {"last_update_time": last_time}})
                     if not result.get("is_exist"):
                         page_num = self.driver.find_elements_by_class_name('page_num')[-1].text.split('/')[-1].lstrip()
                         if page_num:
@@ -95,15 +107,17 @@ class WeChat():
                                     break
                 else:
                     self.logging.info("此公众号无更新，最近更新时间%s" % nickinfo.get('last_update_time'))
-            else:
-                return is_success_spider
+        except MyException as e:
+            self.logging.error("%s,请更换账号或者24小时后再试" % e.message)
+            data['error_code'] = "001"
         except Exception as e:
+            data['error_code'] = "002"
             self.logging.error(e)
-            return is_success_spider
-        is_success_spider =True
-        return is_success_spider
+        data['result'] = True
+        return data
 
-    def get_search(self,nickname):
+
+    def get_account_info(self,nickname):
         driver =self.driver
         self.logging.info('休眠%d秒后，输入公众号名称：%s' %(self.sleep_time,nickname))
         time.sleep(self.sleep_time)
@@ -115,14 +129,18 @@ class WeChat():
         driver.find_element_by_xpath('//*[@id="myform"]/div[3]/div[3]/div[1]/div/span[1]/a[2]').click()
         self.logging.info('休眠%d秒后，查找对应公众号文章' %(self.sleep_time*3))
         time.sleep(self.sleep_time*3)
-        # 查找对应公众号
+        # 查找对应公众号 frm_msg_content
         account_nodes = driver.find_elements_by_xpath('//*[@id="myform"]//div[@data-nickname="'+nickname+'"]')
         if account_nodes:
             account_node = account_nodes[0]
             # self.get_account_info(nickname,account_node)
             account_node.find_element_by_xpath('./div[3]/p[2]').click()
-            return self.get_account_info(account_node)
+            # return self.get_account_detail(account_node)
+            return True
         else:
+            node = driver.find_element_by_class_name('frm_msg_content')
+            if node:
+                raise MyException(node.text)
             return None
 
     def get_articles(self,account_id):
@@ -150,8 +168,8 @@ class WeChat():
             m5 = md5()
             m5.update(url.encode("utf-8"))
             id = m5.hexdigest()
-            res =self.media_db.find_one({"_id": id})
-            res1 =self.media_new_db.find_one({"_id": id})
+            res =self.db.get("media_col").find_one({"_id": id})
+            res1 =self.db.get("new_media_col").find_one({"_id": id})
             if res or res1:
                 # logging.info("文章:%s,已存在"  %temp_dict.get('msg_title'))
                 results['is_exist'] = True
@@ -167,17 +185,21 @@ class WeChat():
                 temp_dict.update(self.get_tag(url))
                 self.logging.info("新增文章:%s,发布时间%s" % (temp_dict.get('title'), temp_dict.get('time')))
                 data.append(temp_dict)
-                # media_new_db.insert_one(atticle_data)
+                # new_media_col.insert_one(atticle_data)
                 time.sleep(1)
         results['data'] =data
         return results
 
-    def logining(self, account):
+    def logining(self,account_id):
         """
         处理登录相关工作
         :param account: (username,password)
         :return: None
         """
+        conf = configparser.ConfigParser()
+        conf.read('config.ini')
+        username = conf.get(account_id, 'username')
+        password = conf.get(account_id, 'password')
         driver = self.driver
         self.logging.info('打开微信公众号登录页面')
         driver.get('https://mp.weixin.qq.com/')
@@ -186,10 +208,10 @@ class WeChat():
         time.sleep(self.sleep_time)
         driver.find_element_by_xpath("//*[@id=\"header\"]/div[2]/div/div/form/div[1]/div[1]/div/span/input").clear()
         driver.find_element_by_xpath("//*[@id=\"header\"]/div[2]/div/div/form/div[1]/div[1]/div/span/input").send_keys(
-            account[0])
+            username)
         driver.find_element_by_xpath("//*[@id=\"header\"]/div[2]/div/div/form/div[1]/div[2]/div/span/input").clear()
         driver.find_element_by_xpath("//*[@id=\"header\"]/div[2]/div/div/form/div[1]/div[2]/div/span/input").send_keys(
-            account[1])
+            password)
         self.logging.info('休眠%d秒，自动点击登录按钮进行登录' %(self.sleep_time))
         time.sleep(self.sleep_time)
         driver.find_element_by_xpath("//*[@id=\"header\"]/div[2]/div/div/form/div[4]/a").click()
@@ -202,9 +224,11 @@ class WeChat():
         :return: None
         """
         driver = self.driver
-        self.logging.info('进入新建图文素材')
+        self.logging.info('进入素材管理')
         driver.find_element_by_xpath('//*[@id="menuBar"]/li[4]/ul/li[3]/a/span/span').click()
-        driver.find_element_by_xpath('//*[@id="js_main"]/div[3]/div[1]/div[2]/div[2]/div/a[1]').click()
+        self.logging.info('休眠%d秒，新建图文素材' % (self.sleep_time))
+        time.sleep(self.sleep_time)
+        driver.find_element_by_xpath('//*[@id="js_main"]/div[3]/div[1]/div[2]/div[2]/div/button[1]').click()
         self.logging.info('休眠%d秒，切换到新窗口' %(self.sleep_time))
         time.sleep(self.sleep_time)
         for handle in driver.window_handles:
@@ -262,7 +286,7 @@ class WeChat():
         self.driver.find_element_by_xpath('//*[@id="myform"]/div[3]/div[3]/div[1]/div/span[1]/input').send_keys(nickname)
 
     @staticmethod
-    def get_account_info(account_node):
+    def get_account_detail(account_node):
         """
         获取公众号的详细信息
         :param nickname: 公众号名称
@@ -294,13 +318,39 @@ class WeChat():
             self.driver.quit()
 
     def get_accounts(self,finish_time,start_time="2018-01-01"):
-        cursor =self.account_db.find({"last_update_time":{"$gt":start_time},"last_spider_time":{"$lt":finish_time}})
+        """
+
+        :param finish_time: 爬取截止时间 ex：20180101
+        :param start_time:  账号更新开始时间 ex：20180101
+        :return:
+        """
+        cursor =self.db.get("account_col").find({"last_update_time":{"$gt":start_time},"last_spider_time":{"$lt":finish_time}})
         for item in cursor.sort("last_update_time",pymongo.DESCENDING):
             yield item
 
     @staticmethod
     def get_date():
-        return time.strftime("%Y-%m-%d",time.localtime())
+        return time.strftime("%Y%m%d",time.localtime())
+
+    def new_to_old(self):
+        for item in self.db.get("new_media_col").find():
+            self.db.get("media_col").insert_one(item)
+
+    def update_account(self):
+        for item in self.db.get("account_col").find():
+            last_update_time =""
+            if item.get('last_update_time'):
+                last_update_time =item.get('last_update_time').replace("-","")
+            self.db.get("account_col").update({"_id": item.get('_id')}, {"$set": {"last_spider_time": "20181202","last_update_time": last_update_time}})
+
+    @staticmethod
+    def update_to_server():
+        bin_path = r"C:\Program Files\MongoDB\Server\4.0\bin"
+        mongo = os.path.join(bin_path, "mongo.exe")
+        cmd = '"' + mongo + '" ../script/update.js'
+        # return_code = subprocess.call(,shell=True)
+        subprocess.call(cmd, shell=True)
+
 #
 # if __name__ == "__main__":
 #     pass
